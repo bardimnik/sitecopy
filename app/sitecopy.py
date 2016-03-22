@@ -3,6 +3,7 @@ from paramiko.client import SSHClient
 from paramiko.client import AutoAddPolicy
 import sys
 import os
+from shutil import rmtree
 import datetime
 import tarfile
 import gzip
@@ -110,8 +111,10 @@ class SiteCopy:
                     exit()
             elif param == '-h' or param == '--help':
                 SiteCopy.print_usage()
+                exit()
             elif param == '-v' or param == '--version':
                 SiteCopy.version()
+                exit()
 
     def run(self):
         print("Packing files...")
@@ -244,9 +247,18 @@ class SiteCopy:
             os.unlink(os.path.join(self.files_config['local_tmp_path'], self.dbschemafile))
 
     def extract_local_files(self):
+        # Разархивируем файлы
         tar = tarfile.open(os.path.join(self.files_config['local_tmp_path'], self.archivefile))
         tar.extractall(self.files_config['local_files_path'])
         tar.close()
+        # Создаем исключенные папки
+        if len(self.files_config['exclude_folder']) > 0:
+            for folder in self.files_config['exclude_folder']:
+                fname = "{}/{}".format(self.files_config['local_files_path'], folder)
+                if os.path.isdir(fname):
+                    rmtree(fname, True)
+                os.mkdir(fname, 0o0755)
+        # Разархивируем дампы базы
         with gzip.open(os.path.join(self.files_config['local_tmp_path'], self.dbfile), 'rb') as infile:
             with open(os.path.join(self.files_config['local_tmp_path'], "db.sql"), 'wb') as outfile:
                 for line in infile:
