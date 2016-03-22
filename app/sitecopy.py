@@ -1,11 +1,13 @@
 import configparser
 from paramiko.client import SSHClient
+from paramiko.client import AutoAddPolicy
 import sys
 import os
 import datetime
 import tarfile
 import gzip
 import pymysql
+import atexit
 
 class SiteCopy:
     """ Разворачивает сайт с боевого сервера в локальном окружении
@@ -40,7 +42,7 @@ class SiteCopy:
             config_path = os.path.join(self.app_path, self.config_file)
         if not os.path.isfile(config_path):
             SiteCopy.print_usage()
-            self.end()
+            exit()
         else:
             self.config = configparser.ConfigParser()
             self.config.read(self.config_file)
@@ -52,6 +54,7 @@ class SiteCopy:
             'filemask': self.config.get('Files Configuration', 'filemask'),
             'local_files_path': self.config.get('Files Configuration', 'local_files_path'),
             'local_tmp_path': self.config.get('Files Configuration', 'local_tmp_path'),
+            'exclude_folder': [i.strip() for i in self.config.get('Files Configuration', 'exclude_folder').split(',')],
         }
         self.ssh_config = {
             'username': self.config.get('SSHConnection', 'username'),
@@ -65,6 +68,7 @@ class SiteCopy:
             'user': self.config.get('MYSQL Remote', 'user'),
             'password': self.config.get('MYSQL Remote', 'password'),
             'dbname': self.config.get('MYSQL Remote', 'dbname'),
+            'exclude_tables': [i.strip() for i in self.config.get('MYSQL Remote', 'exclude_tables').split(',')],
         }
         self.mysql_local_config = {
             'host': self.config.get('MYSQL Local', 'host'),
@@ -85,6 +89,8 @@ class SiteCopy:
         # Генерируем имена файлов
         self.archivefile = "{}.tar.gz".format(self.get_file_name())
         self.dbfile = "{}.sql.gz".format(self.get_file_name())
+        self.dbschemafile = "{}.schema.sql.gz".format(self.get_file_name())
+        atexit.register(self.end)
 
     def process_argv(self, argv):
         """
@@ -101,7 +107,7 @@ class SiteCopy:
                     self.config_file = argv[key + 1]
                 except IndexError:
                     SiteCopy.print_usage()
-                    self.end()
+                    exit()
             elif param == '-h' or param == '--help':
                 SiteCopy.print_usage()
             elif param == '-v' or param == '--version':
@@ -116,7 +122,7 @@ class SiteCopy:
         self.extract_local_files()
         self.dbimport()
         self.clear_all()
-        self.end()
+        exit()
 
     @classmethod
     def print_usage(cls):
@@ -130,12 +136,12 @@ class SiteCopy:
         """ Завершаем работу
         :return:
         """
+        print('Handles cleanup')
         self.stdin.close()
         self.stdout.close()
         self.stderr.close()
         self.ssh.close()  # Закрываем коннект к ssh
         self.db.close()
-        exit()
 
     def __print_config(self):
         for section, section_proxy in self.config.items():
@@ -149,6 +155,7 @@ class SiteCopy:
         """
         self.ssh = SSHClient()
         self.ssh.load_system_host_keys()
+        self.ssh.set_missing_host_key_policy(AutoAddPolicy())
         self.ssh.connect(
             self.ssh_config['hostname'],
             port=self.ssh_config['port'],
@@ -163,6 +170,93 @@ class SiteCopy:
             password=self.mysql_local_config['password'],
             charset='utf8mb4',
         )
+
+    def pack_files(self):
+        """
+        Делаем резервную копию файлов удаленного сайта
+        :return:
+        """
+        command = ["tar czf"]
+        command.append("{}/{}".format(self.files_config['archives_path'], self.archivefile))
+        command.append("-C {}".format(self.files_config['files_path']))
+        if len(self.files_config['exclude_folder']) > 0:
+            for folder in self.files_config['exclude_folder']:
+                command.append('--exclude={!r}'.format(folder))
+        command.append('.')
+        self.exec(' '.join(command))
+        self.stdout.read()
+        print("All files are packed in")
+
+    def pack_db(self):
+        # Архивируем схему базы
+        command = ["mysqldump"]
+        command.append("-u{}".format(self.mysql_config['user']))
+        command.append("-h{}".format(self.mysql_config['host']))
+        command.append("-P{}".format(self.mysql_config['port']))
+        command.append("-p{}".format(self.mysql_config['password']))
+        command.append("--no-data")
+        command.append("{} | gzip > {}".format(
+            self.mysql_config['dbname'],
+            "{0}/{1}".format(
+                self.files_config['archives_path'],
+                self.dbschemafile
+            )
+        ))
+        self.exec(" ".join(command))
+        self.stdout.read()
+
+        # Архивируем базу без исключенных таблиц
+        command = ["mysqldump"]
+        command.append("-u{}".format(self.mysql_config['user']))
+        command.append("-h{}".format(self.mysql_config['host']))
+        command.append("-P{}".format(self.mysql_config['port']))
+        command.append("-p{}".format(self.mysql_config['password']))
+        if len(self.mysql_config['exclude_tables']) > 0:
+            for table in self.mysql_config['exclude_tables']:
+                command.append('--ignore-table={}.{}'.format(self.mysql_config['dbname'], table))
+        command.append("{} | gzip > {}".format(
+            self.mysql_config['dbname'],
+            "{0}/{1}".format(
+                self.files_config['archives_path'],
+                self.dbfile
+            )
+        ))
+        self.exec(" ".join(command))
+        self.stdout.read()
+
+    def transfer(self):
+        print("Transfer files begin")
+        self.sftp.get("{}/{}".format(self.files_config['archives_path'], self.archivefile), os.path.join(self.files_config['local_tmp_path'], self.archivefile))
+        self.sftp.get("{}/{}".format(self.files_config['archives_path'], self.dbfile), os.path.join(self.files_config['local_tmp_path'], self.dbfile))
+        self.sftp.get("{}/{}".format(self.files_config['archives_path'], self.dbschemafile), os.path.join(self.files_config['local_tmp_path'], self.dbschemafile))
+        print("Endof transfer files")
+
+    def clear_all(self):
+        print("Clearing remote archives")
+        self.exec("rm {0}/{1} {0}/{2}".format(self.files_config['archives_path'], self.archivefile, self.dbfile))
+        self.stdout.read()
+        print("Clearing local archives")
+        if os.path.isfile(os.path.join(self.files_config['local_tmp_path'], 'db.sql')):
+            os.unlink(os.path.join(self.files_config['local_tmp_path'], 'db.sql'))
+            os.unlink(os.path.join(self.files_config['local_tmp_path'], 'db.schema.sql'))
+            os.unlink(os.path.join(self.files_config['local_tmp_path'], self.archivefile))
+            os.unlink(os.path.join(self.files_config['local_tmp_path'], self.dbfile))
+            os.unlink(os.path.join(self.files_config['local_tmp_path'], self.dbschemafile))
+
+    def extract_local_files(self):
+        tar = tarfile.open(os.path.join(self.files_config['local_tmp_path'], self.archivefile))
+        tar.extractall(self.files_config['local_files_path'])
+        tar.close()
+        with gzip.open(os.path.join(self.files_config['local_tmp_path'], self.dbfile), 'rb') as infile:
+            with open(os.path.join(self.files_config['local_tmp_path'], "db.sql"), 'wb') as outfile:
+                for line in infile:
+                    outfile.write(line)
+        with gzip.open(os.path.join(self.files_config['local_tmp_path'], self.dbschemafile), 'rb') as infile:
+            with open(os.path.join(self.files_config['local_tmp_path'], "db.schema.sql"), 'wb') as outfile:
+                for line in infile:
+                    outfile.write(line)
+
+    def dbimport(self):
         # Drop database
         with self.db.cursor() as cursor:
             sql = "DROP DATABASE IF EXISTS {}".format(self.mysql_local_config['dbname'])
@@ -177,55 +271,11 @@ class SiteCopy:
         with self.db.cursor() as cursor:
             sql = "USE {}".format(self.mysql_local_config['dbname'])
             cursor.execute(sql)
-
-
-    def pack_files(self):
-        """
-        Делаем резервную копию файлов удаленного сайта
-        :return:
-        """
-        self.exec("tar czf {0}/{1} -C {2} .".format(self.files_config['archives_path'], self.archivefile, self.files_config['files_path']))
-        self.stdout.read()
-        print("All files are packed in")
-
-    def pack_db(self):
-        # Генерируем имя файла
-        self.exec("mysqldump -u{} -h{} -P{} -p{} {} | gzip > {}".format(
-            self.mysql_config['user'],
-            self.mysql_config['host'],
-            self.mysql_config['port'],
-            self.mysql_config['password'],
-            self.mysql_config['dbname'],
-            "{0}/{1}".format(self.files_config['archives_path'], self.dbfile)
-        ))
-        self.stdout.read()
-
-    def transfer(self):
-        print("Transfer files begin")
-        self.sftp.get("{}/{}".format(self.files_config['archives_path'], self.archivefile), os.path.join(self.files_config['local_tmp_path'], self.archivefile))
-        self.sftp.get("{}/{}".format(self.files_config['archives_path'], self.dbfile), os.path.join(self.files_config['local_tmp_path'], self.dbfile))
-        print("Endof transfer files")
-
-    def clear_all(self):
-        print("Clearing remote archives")
-        self.exec("rm {0}/{1} {0}/{2}".format(self.files_config['archives_path'], self.archivefile, self.dbfile))
-        self.stdout.read()
-        print("Clearing local archives")
-        if os.path.isfile(os.path.join(self.files_config['local_tmp_path'], 'db.sql')):
-            os.unlink(os.path.join(self.files_config['local_tmp_path'], 'db.sql'))
-            os.unlink(os.path.join(self.files_config['local_tmp_path'], self.archivefile))
-            os.unlink(os.path.join(self.files_config['local_tmp_path'], self.dbfile))
-
-    def extract_local_files(self):
-        tar = tarfile.open(os.path.join(self.files_config['local_tmp_path'], self.archivefile))
-        tar.extractall(self.files_config['local_files_path'])
-        tar.close()
-        with gzip.open(os.path.join(self.files_config['local_tmp_path'], self.dbfile), 'rb') as infile:
-            with open(os.path.join(self.files_config['local_tmp_path'], "db.sql"), 'wb') as outfile:
-                for line in infile:
-                    outfile.write(line)
-
-    def dbimport(self):
+        # import schema
+        with open(os.path.join(self.files_config['local_tmp_path'], "db.schema.sql"), 'r') as dumpfile:
+            with self.db.cursor() as cursor:
+                sql = " ".join(dumpfile.readlines())
+                cursor.execute(sql)
         # import database
         with open(os.path.join(self.files_config['local_tmp_path'], "db.sql"), 'r') as dumpfile:
             with self.db.cursor() as cursor:
